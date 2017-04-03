@@ -368,6 +368,7 @@ from weakref import WeakKeyDictionary
 import sqlalchemy as sa
 from sqlalchemy.ext.declarative import declared_attr
 from sqlalchemy.sql.functions import _FunctionGenerator
+from sqlalchemy.orm.attributes import get_history
 
 from .functions.orm import get_column_key
 from .relationships import (
@@ -417,6 +418,9 @@ def local_condition(prop, objects):
     for obj in objects:
         try:
             values.append(getattr(obj, key))
+            added, unchanged, deleted = get_history(obj, key)
+            for value in deleted:
+                values.append(value)
         except sa.orm.exc.ObjectDeletedError:
             pass
 
