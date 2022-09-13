@@ -561,7 +561,11 @@ class AggregationManager(object):
 
         for class_, objects in object_dict.items():
             for aggregate_value in self.generator_registry[class_]:
-                query = aggregate_value.update_query(objects)
+                query = aggregate_value.update_query(
+                        list(
+                            filter(lambda obj: session.is_modified(obj, include_collections=False) , objects)
+                            )
+                        )
                 if query is not None:
                     if aggregate_value.update_after == 'commit':
                         self.queries_to_commit.append(query)
