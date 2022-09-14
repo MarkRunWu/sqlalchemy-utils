@@ -414,10 +414,12 @@ def local_condition(prop, objects):
         parent_column = pairs[0][0]
         fetched_column = pairs[0][1]
 
+    logger.info(f"objs: {objects}")
     key = get_column_key(prop.mapper, fetched_column)
 
     values = []
     for obj in objects:
+        logger.info(f"obj: {obj} key: {key}")
         try:
             values.append(getattr(obj, key))
             added, unchanged, deleted = get_history(obj, key)
@@ -437,6 +439,11 @@ def aggregate_expression(expr, class_):
         return expr(sa.sql.text('1'))
     else:
         return expr(class_)
+
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class AggregatedValue(object):
@@ -469,6 +476,7 @@ class AggregatedValue(object):
         if len(self.relationships) == 1:
             prop = self.relationships[-1].property
             condition = local_condition(prop, objects)
+            logger.info(f"cond 1: {condition}")
             if condition is not None:
                 return query.where(condition)
         else:
@@ -490,6 +498,7 @@ class AggregatedValue(object):
                 self.relationships[0].property,
                 objects
             )
+            logger.info(f"cond 2: {condition}")
             if condition is not None:
                 return query.where(
                     local.in_(
@@ -555,6 +564,7 @@ class AggregationManager(object):
     def construct_aggregate_queries(self, session, ctx):
         object_dict = defaultdict(list)
         for obj in session:
+            logger.info(f"sec obj: {obj}")
             class_ = obj.__class__
             if class_ in self.generator_registry:
                 object_dict[class_].append(obj)
