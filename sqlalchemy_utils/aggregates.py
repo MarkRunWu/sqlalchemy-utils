@@ -361,13 +361,13 @@ TODO
 
 """
 
-
 from collections import defaultdict
 from weakref import WeakKeyDictionary
 
 import sqlalchemy as sa
 from sqlalchemy.ext.declarative import declared_attr
 from sqlalchemy.sql.functions import _FunctionGenerator
+from sqlalchemy.orm.attributes import get_history
 
 from .functions.orm import get_column_key
 from .relationships import (
@@ -379,12 +379,40 @@ from .relationships import (
 aggregated_attrs = WeakKeyDictionary()
 
 
+def get_changed_columns(model):
+    """
+    Return a list containing changed columns made to the model since it was
+    fetched from the database.
+
+    Example:
+      user = get_user_by_id(420)
+      >>> '<User id=402 email="business_email@gmail.com">'
+      get_changed_columns(user)
+      >>> {}
+      user.email = 'new_email@who-dis.biz'
+      get_changed_columns(user)
+      >>> ['email']
+    """
+    state = sa.inspect(model)
+    changed_column = []
+    for attr in state.attrs:
+        hist = state.get_history(attr.key, True)
+
+        if not hist.has_changes():
+            continue
+
+        changed_column.append(attr.key)
+    return changed_column
+
+
 class AggregatedAttribute(declared_attr):
     def __init__(
         self,
         fget,
         relationship,
         column,
+        update_after,
+        dependency_columns,
         *args,
         **kwargs
     ):
@@ -392,9 +420,11 @@ class AggregatedAttribute(declared_attr):
         self.__doc__ = fget.__doc__
         self.column = column
         self.relationship = relationship
+        self.update_after = update_after
+        self.dependency_columns = dependency_columns
 
     def __get__(desc, self, cls):
-        value = (desc.fget, desc.relationship, desc.column)
+        value = (desc.fget, desc.relationship, desc.column, desc.update_after, desc.dependency_columns)
         if cls not in aggregated_attrs:
             aggregated_attrs[cls] = [value]
         else:
@@ -417,6 +447,9 @@ def local_condition(prop, objects):
     for obj in objects:
         try:
             values.append(getattr(obj, key))
+            added, unchanged, deleted = get_history(obj, key)
+            for value in deleted:
+                values.append(value)
         except sa.orm.exc.ObjectDeletedError:
             pass
 
@@ -434,7 +467,7 @@ def aggregate_expression(expr, class_):
 
 
 class AggregatedValue(object):
-    def __init__(self, class_, attr, path, expr):
+    def __init__(self, class_, attr, path, expr, update_after, dependency_columns):
         self.class_ = class_
         self.attr = attr
         self.path = path
@@ -442,6 +475,8 @@ class AggregatedValue(object):
             reversed(path_to_relationships(path, class_))
         )
         self.expr = aggregate_expression(expr, class_)
+        self.update_after = update_after
+        self.dependency_columns = dependency_columns
 
     @property
     def aggregate_query(self):
@@ -453,6 +488,22 @@ class AggregatedValue(object):
         )
 
         return query.as_scalar()
+
+    def is_dependency_columns_updated(self, object):
+        changed_columns = get_changed_columns(object)
+        return len(set(self.dependency_columns).intersection(changed_columns)) > 0
+
+    def should_trigger_update(self, session, object):
+        if self.dependency_columns:
+            associated_obj = next(obj for obj in session if obj.__class__ == self.class_)
+
+            return self.is_dependency_columns_updated(object) or (
+                    associated_obj and self.is_dependency_columns_updated(associated_obj))
+
+        if not session.is_modified(object, include_collections=False):
+            return False
+
+        return True
 
     def update_query(self, objects):
         table = self.class_.__table__
@@ -504,6 +555,9 @@ class AggregationManager(object):
 
     def reset(self):
         self.generator_registry = defaultdict(list)
+        self.session_factory = None
+        self.already_committing = False
+        self.queries_to_commit = []
 
     def register_listeners(self):
         sa.event.listen(
@@ -516,15 +570,27 @@ class AggregationManager(object):
             'after_flush',
             self.construct_aggregate_queries
         )
+        sa.event.listen(
+            sa.orm.session.Session,
+            'after_commit',
+            self.on_commit
+        )
+        sa.event.listen(
+            sa.orm.session.Session,
+            'after_commit',
+            self.on_rollback
+        )
 
     def update_generator_registry(self):
         for class_, attrs in aggregated_attrs.items():
-            for expr, path, column in attrs:
+            for expr, path, column, update_after, dependency_columns in attrs:
                 value = AggregatedValue(
                     class_=class_,
                     attr=column,
                     path=path,
-                    expr=expr(class_)
+                    expr=expr(class_),
+                    update_after=update_after,
+                    dependency_columns=dependency_columns
                 )
                 key = value.relationships[0].mapper.class_
                 self.generator_registry[key].append(
@@ -540,9 +606,40 @@ class AggregationManager(object):
 
         for class_, objects in object_dict.items():
             for aggregate_value in self.generator_registry[class_]:
-                query = aggregate_value.update_query(objects)
+                query = aggregate_value.update_query(
+                    list(
+                        filter(lambda obj: aggregate_value.should_trigger_update(session, obj), objects)
+                    )
+                )
                 if query is not None:
-                    session.execute(query)
+                    if aggregate_value.update_after == 'commit':
+                        self.queries_to_commit.append(query)
+                    else:
+                        session.execute(query)
+
+    def on_commit(self, session):
+        if self.already_committing or not self.session_factory:
+            return
+
+        self.already_committing = True
+
+        new_session = None
+        try:
+            new_session = self.session_factory()
+            for query in self.queries_to_commit:
+                new_session.execute(query)
+            new_session.commit()
+        except:
+            if new_session:
+                new_session.rollback()
+        finally:
+            if new_session:
+                new_session.close()
+            self.already_committing = False
+            self.queries_to_commit = []
+
+    def on_rollback(self, session):
+        self.queries_to_commit = []
 
 
 manager = AggregationManager()
@@ -551,7 +648,9 @@ manager.register_listeners()
 
 def aggregated(
     relationship,
-    column
+    column,
+    update_after='flush',
+    dependency_columns=None,
 ):
     """
     Decorator that generates an aggregated attribute. The decorated function
@@ -564,11 +663,21 @@ def aggregated(
     :param column:
         SQLAlchemy Column object. The column definition of this aggregate
         attribute.
+    :param update_after:
+        Sets whether the aggregate is calculated after `flush` or after
+        `commit`. Default is after flush.
+    :param dependency_columns:
+        Defines the aggregate update is triggered only when the dependency_columns updated.
+        If set to None, aggregate update is triggered when model updated.
     """
+
     def wraps(func):
         return AggregatedAttribute(
             func,
             relationship,
-            column
+            column,
+            update_after,
+            dependency_columns
         )
+
     return wraps
