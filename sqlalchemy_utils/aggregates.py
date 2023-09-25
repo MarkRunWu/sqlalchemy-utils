@@ -495,10 +495,10 @@ class AggregatedValue(object):
 
     def should_trigger_update(self, session, object):
         if self.dependency_columns:
-            associated_obj = next(obj for obj in session if obj.__class__ == self.class_)
+            associated_obj = next((obj for obj in session if obj.__class__ == self.class_), None)
 
             return self.is_dependency_columns_updated(object) or (
-                    associated_obj and self.is_dependency_columns_updated(associated_obj))
+                associated_obj and self.is_dependency_columns_updated(associated_obj))
 
         if not session.is_modified(object, include_collections=False):
             return False
